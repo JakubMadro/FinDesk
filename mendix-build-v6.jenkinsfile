@@ -1,0 +1,315 @@
+pipeline {
+    agent {
+        kubernetes {
+            yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: docker
+    image: docker:27-dind
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - name: docker-sock
+      mountPath: /var/run/docker.sock
+  - name: python
+    image: python:3.9-slim
+    command:
+    - cat
+    tty: true
+  volumes:
+  - name: docker-sock
+    hostPath:
+      path: /var/run/docker.sock
+"""
+        }
+    }
+    
+    environment {
+        HARBOR_REGISTRY = 'harbor.local:30002'
+        HARBOR_PROJECT = 'mendix'
+        HARBOR_USER = 'admin'
+        HARBOR_PASS = 'Harbor12345'
+        DOCKER_BUILDKIT = '1'
+    }
+    
+    parameters {
+        string(name: 'MENDIX_APP_PATH', defaultValue: 'mendix-app/src', description: 'Path to Mendix app source')
+        string(name: 'APP_NAME', defaultValue: 'mendix-app', description: 'Application name')
+        string(name: 'VERSION', defaultValue: '${BUILD_NUMBER}', description: 'Version tag')
+        booleanParam(name: 'PUSH_TO_HARBOR', defaultValue: true, description: 'Push images to Harbor registry')
+        booleanParam(name: 'BUILD_BASE_IMAGES', defaultValue: false, description: 'Rebuild base images (builder/runtime)')
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+        
+        stage('Build Base Images') {
+            when {
+                expression { params.BUILD_BASE_IMAGES }
+            }
+            steps {
+                container('docker') {
+                    script {
+                        dir('mendix-app/docker') {
+                            sh '''
+                                # Login to Harbor
+                                echo $HARBOR_PASS | docker login $HARBOR_REGISTRY -u $HARBOR_USER --password-stdin
+                                
+                                # Create Harbor project if not exists
+                                curl -X POST -H "Content-Type: application/json" \
+                                    -u "$HARBOR_USER:$HARBOR_PASS" \
+                                    -d "{\\"project_name\\":\\"$HARBOR_PROJECT\\",\\"public\\":true}" \
+                                    "http://$HARBOR_REGISTRY/api/v2.0/projects" || true
+                                
+                                # Build builder image
+                                docker build \
+                                    -f rootfs-builder.dockerfile \
+                                    -t $HARBOR_REGISTRY/$HARBOR_PROJECT/mendix-builder:latest \
+                                    -t $HARBOR_REGISTRY/$HARBOR_PROJECT/mendix-builder:$(date +%Y%m%d-%H%M%S) \
+                                    .
+                                
+                                # Build app runtime image
+                                docker build \
+                                    -f rootfs-app.dockerfile \
+                                    -t $HARBOR_REGISTRY/$HARBOR_PROJECT/mendix-app-runtime:latest \
+                                    -t $HARBOR_REGISTRY/$HARBOR_PROJECT/mendix-app-runtime:$(date +%Y%m%d-%H%M%S) \
+                                    .
+                                
+                                # Push base images
+                                docker push $HARBOR_REGISTRY/$HARBOR_PROJECT/mendix-builder:latest
+                                docker push $HARBOR_REGISTRY/$HARBOR_PROJECT/mendix-app-runtime:latest
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Validate Mendix App') {
+            steps {
+                container('python') {
+                    script {
+                        sh '''
+                            if [ ! -d "${MENDIX_APP_PATH}" ]; then
+                                echo "Mendix app directory ${MENDIX_APP_PATH} not found"
+                                exit 1
+                            fi
+                            
+                            # Install required Python packages
+                            pip install requests
+                            
+                            # Validate app structure
+                            cd ${MENDIX_APP_PATH}
+                            if [ ! -f "*.mpr" ] && [ ! -f "*.mpk" ] && [ ! -d "model" ]; then
+                                echo "No valid Mendix project found (no .mpr, .mpk, or model directory)"
+                                exit 1
+                            fi
+                            
+                            echo "Mendix app validation passed"
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Prepare Docker Context') {
+            steps {
+                container('python') {
+                    script {
+                        sh '''
+                            # Make build.py executable
+                            chmod +x mendix-app/docker/build.py
+                            
+                            # Create temporary build context
+                            BUILD_CONTEXT="/tmp/mendix-build-${BUILD_NUMBER}"
+                            mkdir -p $BUILD_CONTEXT
+                            
+                            # Run build.py to prepare context
+                            python3 mendix-app/docker/build.py \
+                                --source ${MENDIX_APP_PATH} \
+                                --destination $BUILD_CONTEXT \
+                                build-mda-dir
+                            
+                            # Store build context path for next stage
+                            echo $BUILD_CONTEXT > build_context_path.txt
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Build Application Image') {
+            steps {
+                container('docker') {
+                    script {
+                        def buildContext = readFile('build_context_path.txt').trim()
+                        def imageName = "${HARBOR_REGISTRY}/${HARBOR_PROJECT}/${params.APP_NAME}"
+                        def imageTag = "${params.VERSION}"
+                        def fullImageName = "${imageName}:${imageTag}"
+                        
+                        sh """
+                            # Login to Harbor
+                            echo \$HARBOR_PASS | docker login \$HARBOR_REGISTRY -u \$HARBOR_USER --password-stdin
+                            
+                            # Build application image using prepared context
+                            docker build \
+                                -t ${fullImageName} \
+                                -t ${imageName}:latest \
+                                --build-arg BASE_IMAGE=\$HARBOR_REGISTRY/\$HARBOR_PROJECT/mendix-app-runtime:latest \
+                                ${buildContext}
+                            
+                            echo "Built image: ${fullImageName}"
+                        """
+                        
+                        env.FULL_IMAGE_NAME = fullImageName
+                        env.IMAGE_NAME = imageName
+                        env.BUILD_CONTEXT = buildContext
+                    }
+                }
+            }
+        }
+        
+        stage('Test Application Image') {
+            steps {
+                container('docker') {
+                    script {
+                        sh '''
+                            # Test that image can start
+                            CONTAINER_ID=$(docker run -d --name test-mendix-${BUILD_NUMBER} ${FULL_IMAGE_NAME})
+                            
+                            # Wait a moment for startup
+                            sleep 10
+                            
+                            # Check if container is running
+                            if docker ps | grep -q test-mendix-${BUILD_NUMBER}; then
+                                echo "✅ Container started successfully"
+                            else
+                                echo "❌ Container failed to start"
+                                docker logs test-mendix-${BUILD_NUMBER}
+                                exit 1
+                            fi
+                            
+                            # Cleanup test container
+                            docker stop test-mendix-${BUILD_NUMBER} || true
+                            docker rm test-mendix-${BUILD_NUMBER} || true
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Push to Harbor') {
+            when {
+                expression { params.PUSH_TO_HARBOR }
+            }
+            steps {
+                container('docker') {
+                    script {
+                        sh """
+                            # Push application images
+                            docker push ${env.FULL_IMAGE_NAME}
+                            docker push ${env.IMAGE_NAME}:latest
+                            
+                            echo "📦 Pushed: ${env.FULL_IMAGE_NAME}"
+                            echo "📦 Pushed: ${env.IMAGE_NAME}:latest"
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Update Deployment Manifest') {
+            steps {
+                script {
+                    def manifestPath = "k8s/deployment.yaml"
+                    
+                    if (fileExists(manifestPath)) {
+                        sh """
+                            # Update image in deployment manifest
+                            sed -i 's|image: .*|image: ${env.FULL_IMAGE_NAME}|' ${manifestPath}
+                            
+                            # Commit changes if git repo
+                            if [ -d .git ]; then
+                                git config user.email "jenkins@mendix-cicd.local"
+                                git config user.name "Jenkins CI"
+                                git add ${manifestPath}
+                                git commit -m "Update ${params.APP_NAME} image to ${params.VERSION} [skip ci]" || echo "No changes to commit"
+                            fi
+                        """
+                    } else {
+                        echo "No deployment manifest found at ${manifestPath}"
+                    }
+                }
+            }
+        }
+        
+        stage('Generate Deployment Info') {
+            steps {
+                script {
+                    def deploymentInfo = """
+# Mendix Application Deployment Info
+
+**Application:** ${params.APP_NAME}
+**Version:** ${params.VERSION}
+**Build:** #${BUILD_NUMBER}
+**Image:** `${env.FULL_IMAGE_NAME}`
+
+## Harbor Registry
+- URL: http://${HARBOR_REGISTRY}/harbor/projects/${HARBOR_PROJECT}/repositories
+- Project: ${HARBOR_PROJECT}
+
+## Deployment Command
+\`\`\`bash
+kubectl set image deployment/${params.APP_NAME} ${params.APP_NAME}=${env.FULL_IMAGE_NAME} -n mendix-apps
+\`\`\`
+
+## Direct Run Command
+\`\`\`bash
+docker run -p 8080:8080 -e ADMIN_PASSWORD=admin123 ${env.FULL_IMAGE_NAME}
+\`\`\`
+"""
+                    
+                    writeFile file: 'deployment-info.md', text: deploymentInfo
+                    archiveArtifacts artifacts: 'deployment-info.md'
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            container('docker') {
+                sh '''
+                    # Cleanup build context
+                    if [ -f build_context_path.txt ]; then
+                        BUILD_CONTEXT=$(cat build_context_path.txt)
+                        rm -rf "$BUILD_CONTEXT" || true
+                    fi
+                    
+                    # Cleanup Docker images to save space
+                    docker system prune -f
+                '''
+            }
+        }
+        success {
+            echo "✅ Mendix application ${params.APP_NAME} built successfully!"
+            echo "📦 Image: ${env.FULL_IMAGE_NAME}"
+            echo "🌐 Harbor: http://${HARBOR_REGISTRY}/harbor/projects/${HARBOR_PROJECT}/repositories"
+        }
+        failure {
+            echo "❌ Build failed for ${params.APP_NAME}"
+            container('docker') {
+                sh '''
+                    # Show recent Docker logs for debugging
+                    docker system events --since 10m --until now || true
+                '''
+            }
+        }
+    }
+}
